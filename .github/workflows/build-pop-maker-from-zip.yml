@@ -1,0 +1,121 @@
+name: Build POP Maker Debug APK dari ZIP
+
+# Dipasang SEKALI di repository: .github/workflows/build-from-zip.yml
+# Sesudahnya cukup unggah SATU file POP-Maker-*.zip melalui Add file > Upload files.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'POP-Maker-*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Bangun APK Debug dari ZIP
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repo (ZIP tidak perlu diekstrak saat upload)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Temukan ZIP versi yang terakhir diupload
+        id: choose
+        shell: bash
+        run: |
+          python3 - <<'PYSELECT'
+          import os, pathlib, re, subprocess
+          root = pathlib.Path('.')
+          files = [p for p in root.glob('POP-Maker-*.zip') if p.is_file()]
+          if not files:
+              raise SystemExit('Belum ada POP-Maker-*.zip di root repository. Upload ZIP source terlebih dulu.')
+          changed = subprocess.run(['git','show','--format=','--name-only','HEAD'], capture_output=True, text=True, check=True).stdout.splitlines()
+          changed_set = set(changed)
+          choices = [p for p in files if p.name in changed_set] or files
+          def version_key(path):
+              match = re.search(r'v(\d+(?:\.\d+)*)', path.name, re.I)
+              return tuple(int(x) for x in match.group(1).split('.')) if match else (0,)
+          chosen = sorted(choices, key=lambda p: (version_key(p), p.name))[-1]
+          print('ZIP yang dibuild:', chosen)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('source_zip=' + chosen.name + '\n')
+          PYSELECT
+
+      - name: Ekstrak ZIP di runner GitHub dan temukan root Android
+        id: unpack
+        shell: bash
+        env:
+          SOURCE_ZIP: ${{ steps.choose.outputs.source_zip }}
+        run: |
+          python3 - <<'PYUNPACK'
+          import os, pathlib, stat, zipfile
+          path = pathlib.Path(os.environ['SOURCE_ZIP'])
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'popmaker-source'
+          target.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(path) as archive:
+              entries = archive.infolist()
+              if len(entries) > 5000 or sum(i.file_size for i in entries) > 150_000_000:
+                  raise SystemExit('Isi ZIP terlalu besar.')
+              for info in entries:
+                  p = pathlib.PurePosixPath(info.filename)
+                  if p.is_absolute() or '..' in p.parts or '\\' in info.filename:
+                      raise SystemExit('ZIP berisi path yang tidak aman: ' + info.filename)
+                  if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK:
+                      raise SystemExit('ZIP berisi symlink: ' + info.filename)
+              archive.extractall(target)
+          # Terima source pada root ZIP atau satu folder pembungkus (mis. Pop-main/).
+          roots = [target] + [p for p in target.iterdir() if p.is_dir()]
+          roots = [p for p in roots if (p/'settings.gradle').is_file() and (p/'app/build.gradle').is_file()]
+          if len(roots) != 1:
+              raise SystemExit('ZIP harus memuat satu proyek Android, berisi settings.gradle dan app/build.gradle.')
+          project = roots[0]
+          for relative in ('build.gradle','app/src/main/AndroidManifest.xml','app/src/main/assets/index.html'):
+              if not (project/relative).is_file():
+                  raise SystemExit('Source Android tidak lengkap: ' + relative)
+          print('Root build:', project)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('project_dir=' + str(project) + '\n')
+          PYUNPACK
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK 35
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Check editor JavaScript
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          if [ -f tools/check_editor.py ]; then python3 tools/check_editor.py; fi
+
+      - name: Build APK debug dari ZIP
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Upload APK (bisa diunduh dari Actions > Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: POP-Maker-Debug-APK
+          path: ${{ steps.unpack.outputs.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Ringkasan hasil build
+        run: |
+          echo '### APK debug tersedia di Artifacts: POP-Maker-Debug-APK' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Source: `${{ steps.choose.outputs.source_zip }}`' >> "$GITHUB_STEP_SUMMARY"
